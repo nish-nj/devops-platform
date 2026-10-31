@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+*.pem
+*.key
+node_modules
+logs
+reports
+docs
+monitoring
+deploy
+scripts
+*.md
+*.zip
+docker-compose*.yml

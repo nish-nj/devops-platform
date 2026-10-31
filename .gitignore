@@ -1,0 +1,20 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.ppk
+id_rsa*
+*.crt
+secrets/
+
+# Generated
+logs/
+reports/
+*.log
+*.zip
+.DS_Store
+Thumbs.db
+.vscode/
+node_modules/

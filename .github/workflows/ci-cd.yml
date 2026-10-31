@@ -1,0 +1,227 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege by default; jobs raise only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_BASENAME: devops-platform
+
+jobs:
+  validate:
+    name: 1. Validate files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate project files
+        run: python3 scripts/validate.py
+      - name: ShellCheck (monitoring and deploy scripts)
+        run: |
+          shellcheck monitoring/*.sh scripts/*.sh deploy/*.sh
+      - name: Check JavaScript syntax
+        run: node --check app/js/app.js
+      - name: Explain failure
+        if: failure()
+        run: echo "::error::Validation failed. Open the failed step above, fix the file it names, and push again."
+
+  build-scan:
+    name: 2. Build, scan, push
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name and metadata
+        id: vars
+        run: |
+          owner_repo="${GITHUB_REPOSITORY,,}"
+          echo "image=ghcr.io/${owner_repo}/${IMAGE_BASENAME}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (loaded locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.ref_name }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.vars.outputs.build_time }}
+            DEPLOY_ENV=production
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy - full report (CRITICAL, HIGH, MEDIUM, LOW)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          format: table
+          output: trivy-report.txt
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Trivy - JSON report
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          format: json
+          output: trivy-report.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Publish report summary
+        if: always()
+        run: |
+          {
+            echo "## Trivy scan report"
+            echo '```'
+            head -n 120 trivy-report.txt 2>/dev/null || echo "report missing"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: |
+            trivy-report.txt
+            trivy-report.json
+
+      # Policy: fail on CRITICAL vulnerabilities that have a fix available.
+      - name: Trivy - policy gate (fail on fixable CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Explain scan failure
+        if: failure()
+        run: |
+          echo "::error::Security gate failed - fixable CRITICAL vulnerabilities. Download the trivy-report artifact and see docs/SECURITY.md for fixes."
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image (main branch only)
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+            ${{ steps.vars.outputs.image }}:latest
+          build-args: |
+            APP_VERSION=${{ github.ref_name }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.vars.outputs.build_time }}
+            DEPLOY_ENV=production
+          cache-from: type=gha
+
+  deploy:
+    name: 3. Deploy to AWS EC2
+    needs: build-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USERNAME: ${{ secrets.AWS_USERNAME }}
+          AWS_SSH_PRIVATE_KEY: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+        run: |
+          for v in AWS_HOST AWS_USERNAME AWS_SSH_PRIVATE_KEY; do
+            if [ -z "${!v}" ]; then echo "::error::Missing GitHub secret $v (Settings > Secrets and variables > Actions)"; exit 1; fi
+          done
+
+      - name: Configure SSH
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_SSH_PRIVATE_KEY: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+          AWS_KNOWN_HOSTS: ${{ secrets.AWS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$AWS_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$AWS_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$AWS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::AWS_KNOWN_HOSTS not set; trusting host key on first contact (see docs/SECURITY.md)."
+            ssh-keyscan -H "$AWS_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+
+      - name: Copy deployment files to server
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USERNAME: ${{ secrets.AWS_USERNAME }}
+        run: |
+          SSH="ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15"
+          $SSH "$AWS_USERNAME@$AWS_HOST" "mkdir -p ~/devops-platform"
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes -r docker-compose.yml monitoring deploy "$AWS_USERNAME@$AWS_HOST:~/devops-platform/"
+
+      - name: Pull and start the new image
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USERNAME: ${{ secrets.AWS_USERNAME }}
+          IMAGE: ${{ needs.build-scan.outputs.image }}:${{ github.sha }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The short-lived workflow token is sent over stdin (never on the command line, never stored in a file).
+          printf '%s' "$GH_TOKEN" | ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$AWS_USERNAME@$AWS_HOST" \
+            "set -e; docker login ghcr.io -u '$GH_ACTOR' --password-stdin >/dev/null && \
+             cd ~/devops-platform && \
+             IMAGE='$IMAGE' BIND_ADDR=127.0.0.1 HOST_PORT=8080 docker compose pull && \
+             IMAGE='$IMAGE' BIND_ADDR=127.0.0.1 HOST_PORT=8080 docker compose up -d --remove-orphans && \
+             docker logout ghcr.io >/dev/null && docker image prune -f >/dev/null"
+
+      - name: Smoke test (through Nginx on port 80)
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 10 "http://$AWS_HOST/healthz" | grep -q ok; then
+              echo "Deployment healthy."; echo "### Deployed ${GITHUB_SHA::7} to EC2 - healthy" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            echo "Waiting for app... ($i/6)"; sleep 10
+          done
+          echo "::error::Smoke test failed: http://$AWS_HOST/healthz did not answer. See docs/TROUBLESHOOTING.md"; exit 1
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
