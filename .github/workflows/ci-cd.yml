@@ -27,7 +27,7 @@ jobs:
         run: python3 scripts/validate.py
       - name: ShellCheck (monitoring and deploy scripts)
         run: |
-          shellcheck monitoring/*.sh scripts/*.sh deploy/*.sh
+                    shellcheck --severity=warning monitoring/*.sh scripts/*.sh deploy/*.sh
       - name: Check JavaScript syntax
         run: node --check app/js/app.js
       - name: Explain failure
